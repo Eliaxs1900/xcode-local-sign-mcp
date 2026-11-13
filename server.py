@@ -211,6 +211,22 @@ async def _entitlements(app: str, strict: bool = False) -> dict:
         return {"_raw": r.out}
 
 
+NESTED_CODE = (".framework", ".dylib", ".appex", ".xpc", ".app")
+
+
+def _nested_code(app: Path) -> list[Path]:
+    """Code inside `app`, deepest first: each piece has to be signed before
+    whatever contains it. Symlinks are skipped (their target is signed
+    through its real path); os.walk does not follow them either."""
+    found = []
+    for root, dirs, files in os.walk(app):
+        for name in dirs + files:
+            p = Path(root) / name
+            if name.endswith(NESTED_CODE) and not p.is_symlink():
+                found.append(p)
+    return sorted(found, key=lambda p: len(p.parts), reverse=True)
+
+
 def _errors(text: str, limit: int = 25) -> list[str]:
     seen, out = set(), []
     for line in text.splitlines():
@@ -324,7 +340,9 @@ async def resign_adhoc(app_path: str, add: dict | None = None, remove: list[str]
     """Re-sign an .app ad-hoc keeping its entitlements, with keys added
     (`add`, e.g. {"com.apple.security.network.client": true}) or removed
     (`remove`). `copy_to` works on a copy so the original build stays intact.
-    Nested frameworks/dylibs are re-signed first."""
+    Nested code (frameworks, dylibs, extensions, XPC services, helper apps)
+    is re-signed first, deepest first; extensions, XPC services and helper
+    apps keep their own entitlements."""
     src, _ = _bundle(app_path)
     try:
         plistlib.dumps(add or {})
@@ -362,11 +380,13 @@ async def resign_adhoc(app_path: str, add: dict | None = None, remove: list[str]
     runtime = bool(re.search(r"flags=0x[0-9a-f]+\([^)]*runtime", dv))
     if runtime:
         ents["com.apple.security.cs.disable-library-validation"] = True
-    nested = sorted({str(p) for pat in ("**/*.framework", "**/*.dylib", "**/*.appex", "**/*.xpc")
-                     for p in app.glob(pat)}, key=len, reverse=True)
+    nested = _nested_code(app)
     logs = []
     for n in nested:
-        r = await _run(["codesign", "--force", "--sign", "-", "--timestamp=none", n], 120)
+        # Extensions, XPC services and helper apps carry their own entitlements
+        # (usually their own sandbox); re-signing without them breaks them.
+        keep = ["--preserve-metadata=entitlements"] if n.suffix in (".appex", ".xpc", ".app") else []
+        r = await _run(["codesign", "--force", "--sign", "-", "--timestamp=none", *keep, str(n)], 120)
         if r.code:
             logs.append(f"{n}: {r.err.strip()}")
     fd, ent_file = tempfile.mkstemp(suffix=".plist")
@@ -381,6 +401,7 @@ async def resign_adhoc(app_path: str, add: dict | None = None, remove: list[str]
     v = await _run(["codesign", "--verify", "--deep", "--strict", str(app)], 120)
     return json.dumps({"app": str(app), "signed": r.code == 0, "sign_stderr": r.err.strip(),
                        "verify_ok": v.code == 0, "verify": v.err.strip(),
+                       "nested_signed": [str(n.relative_to(app)) for n in nested],
                        "nested_errors": logs, "entitlements": await _entitlements(str(app))},
                       indent=2, default=str)
 
