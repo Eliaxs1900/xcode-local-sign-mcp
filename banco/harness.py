@@ -455,7 +455,9 @@ class Suite:
                  exit=js and js.get("exit"), exit_signal=js and js.get("exit_signal"),
                  hints=js and js.get("hints"), console=js and js.get("console", [])[-3:],
                  system_log=js and js.get("system_log", [])[-3:], text=None if js else text[:300])
-        err, text, js, dt = self.call("launch_with_trace", {"app_path": str(self.app_mac), "seconds": 1000})
+        # evidence_dir always: the old version accepts 1000 s and would write to ~/Desktop.
+        err, text, js, dt = self.call("launch_with_trace", {"app_path": str(self.app_mac), "seconds": 1000,
+                                                             "evidence_dir": str(self.R / "ev_1000")})
         self.rec("launch_with_trace seconds=1000", seconds=dt, error=err, text=text[:300])
 
     def launch_stdin(self):
