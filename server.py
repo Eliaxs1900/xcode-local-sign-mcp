@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2,<2"]
+# dependencies = ["mcp>=1.10,<2"]
 # ///
 """xcode-local-sign-mcp: build, sign and run Xcode apps on this Mac WITHOUT an
 Apple developer certificate, and capture a log trace as proof.
@@ -10,7 +10,7 @@ no signing identity, so a plain `xcodebuild` fails or produces an app the
 sandbox will not run. Ad-hoc signing ("-") is enough to build and launch
 locally, with the app's real entitlements and App Sandbox enforced.
 
-Tools
+Tools (their descriptions and parameter docs below are what the AI client sees)
   signing_status      identities in the keychain, the project's teams/signing
                       settings and sandbox entitlement build settings
   build_local         xcodebuild with ad-hoc signing (team cleared); returns the
@@ -43,11 +43,29 @@ import time
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Annotated, Any
 
 import anyio
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
-mcp = FastMCP("xcode-local-sign")
+INSTRUCTIONS = """\
+Builds, signs and runs Xcode apps on this Mac without an Apple developer
+certificate (ad-hoc signing), and records what the App Sandbox did.
+
+Typical flow:
+1. signing_status(project): schemes, team and sandbox settings.
+2. build_local(project, scheme): ad-hoc build; returns the .app and its entitlements.
+3. To test one permission: resign_adhoc(app, add=... or remove=..., copy_to=...)
+   gives a copy with and a copy without it.
+4. launch_with_trace(app, env, seconds): runs it and returns its console and
+   the kernel's sandbox log lines; everything is saved in an evidence folder.
+
+Ad-hoc apps only run on this Mac. XCTest/XCUITest still need a development
+certificate (the user signs in to Xcode with an Apple ID)."""
+
+mcp = FastMCP("xcode-local-sign", instructions=INSTRUCTIONS)
 
 ADHOC = ["CODE_SIGN_IDENTITY=-", "DEVELOPMENT_TEAM=", "CODE_SIGN_STYLE=Manual",
          "PROVISIONING_PROFILE_SPECIFIER="]
@@ -254,11 +272,20 @@ def _errors(text: str) -> list[str]:
 
 # --- tools ------------------------------------------------------------------
 
-@mcp.tool()
-async def signing_status(project: str | None = None) -> str:
-    """Signing identities on this Mac and, if `project` is given (folder,
-    .xcodeproj or .xcworkspace), its team, signing style and sandbox/network
-    entitlement build settings."""
+PROJECT_DOC = ("Folder that contains the project, or the path of a .xcodeproj or "
+               ".xcworkspace (a folder with both uses the workspace).")
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Signing status", readOnlyHint=True))
+async def signing_status(
+    project: Annotated[str | None, Field(description=PROJECT_DOC + " Omit it to only check this Mac.")] = None,
+) -> str:
+    """Check how this Mac and a project are set up for signing, before building.
+    Returns JSON: the code-signing identities in the keychain (usually none,
+    which is why build_local signs ad-hoc), the Xcode version and, with
+    `project`, its schemes and targets (xcodebuild -list) plus the signing and
+    sandbox build settings in its project files (DEVELOPMENT_TEAM,
+    CODE_SIGN_*, ENABLE_APP_SANDBOX, ENABLE_*NETWORK*...). Changes nothing."""
     out: dict = {}
     r = await _run(["security", "find-identity", "-v", "-p", "codesigning"], 30)
     out["identities"] = [l.strip() for l in r.out.splitlines() if '"' in l]
@@ -294,20 +321,31 @@ async def signing_status(project: str | None = None) -> str:
     return json.dumps(out, indent=2, ensure_ascii=False)
 
 
-@mcp.tool()
-async def build_local(project: str, scheme: str,
-                      destination: str = "platform=macOS,variant=Mac Catalyst",
-                      configuration: str = "Debug",
-                      derived_data: str | None = None,
-                      extra_settings: list[str] | None = None,
-                      timeout_s: int = 1800) -> str:
-    """Build `scheme` signed ad-hoc (no certificate, team cleared). Destination
-    examples: 'platform=macOS,variant=Mac Catalyst', 'platform=macOS',
-    'platform=iOS Simulator,name=iPad Pro 13-inch (M5)'. extra_settings are
-    KEY=VALUE build settings (e.g. ENABLE_OUTGOING_NETWORK_CONNECTIONS=NO).
-    Returns the built .app path(s), their entitlements and any errors."""
-    if not 10 <= timeout_s <= 7200:
-        raise ValueError("timeout_s must be between 10 and 7200 seconds")
+@mcp.tool(annotations=ToolAnnotations(title="Build with ad-hoc signing", readOnlyHint=False,
+                                      destructiveHint=False, idempotentHint=True))
+async def build_local(
+    project: Annotated[str, Field(description=PROJECT_DOC)],
+    scheme: Annotated[str, Field(description="Scheme to build; signing_status(project) lists them.")],
+    destination: Annotated[str, Field(description=(
+        "xcodebuild -destination: 'platform=macOS,variant=Mac Catalyst' (iPad apps on the Mac), "
+        "'platform=macOS' (native Mac apps) or 'generic/platform=iOS Simulator' (only builds: "
+        "launch_with_trace cannot run Simulator apps)."))] = "platform=macOS,variant=Mac Catalyst",
+    configuration: Annotated[str, Field(description="Build configuration, usually Debug or Release.")] = "Debug",
+    derived_data: Annotated[str | None, Field(description=(
+        "Folder for the build products and build_local.log. Default: "
+        "~/Desktop/xcode_local_builds/<scheme>_<destination>, reused so rebuilds are incremental."))] = None,
+    extra_settings: Annotated[list[str] | None, Field(description=(
+        "Extra build settings, each KEY=VALUE, e.g. ['ENABLE_OUTGOING_NETWORK_CONNECTIONS=NO']. "
+        "Actions or options such as 'clean' or '-quiet' are refused."))] = None,
+    timeout_s: Annotated[int, Field(ge=10, le=7200, description="Stop the build after this many seconds.")] = 1800,
+) -> str:
+    """Build a scheme with ad-hoc signing: no certificate needed (team and
+    provisioning profile are cleared), so a cloned project builds and runs on
+    this Mac with its real entitlements and App Sandbox.
+    Returns JSON: ok, timed_out, exit_code, seconds, the exact xcodebuild
+    command, the log path, up to 25 error lines (errors_total), hints for
+    common failures and the built .app paths with their signed entitlements.
+    May take minutes; on timeout or cancellation the build is stopped cleanly."""
     bad = [s for s in extra_settings or [] if not BUILD_SETTING.match(s)]
     if bad:
         # Anything else would reach xcodebuild as an action ('clean') or an option.
@@ -348,22 +386,42 @@ async def build_local(project: str, scheme: str,
     return json.dumps(res, indent=2, ensure_ascii=False, default=str)
 
 
-@mcp.tool()
-async def show_entitlements(app_path: str) -> str:
-    """Entitlements actually signed into an .app (what the sandbox enforces)."""
+@mcp.tool(annotations=ToolAnnotations(title="Show signed entitlements", readOnlyHint=True,
+                                      openWorldHint=False))
+async def show_entitlements(
+    app_path: Annotated[str, Field(description="The .app bundle, e.g. one returned by build_local or resign_adhoc.")],
+) -> str:
+    """Entitlements signed into an .app: what the App Sandbox and the system
+    actually enforce, which can differ from the project's .entitlements file.
+    Returns them as JSON ({} means signed without entitlements). Fails if the
+    path does not exist or is not signed. Changes nothing."""
     app = _existing(app_path, "app")
     return json.dumps(await _entitlements(str(app), strict=True), indent=2, default=str)
 
 
-@mcp.tool()
-async def resign_adhoc(app_path: str, add: dict | None = None, remove: list[str] | None = None,
-                       copy_to: str | None = None) -> str:
-    """Re-sign an .app ad-hoc keeping its entitlements, with keys added
-    (`add`, e.g. {"com.apple.security.network.client": true}) or removed
-    (`remove`). `copy_to` works on a copy so the original build stays intact.
+@mcp.tool(annotations=ToolAnnotations(title="Re-sign ad-hoc with other entitlements", readOnlyHint=False,
+                                      destructiveHint=True, idempotentHint=True, openWorldHint=False))
+async def resign_adhoc(
+    app_path: Annotated[str, Field(description="The .app to re-sign.")],
+    add: Annotated[dict[str, Any] | None, Field(description=(
+        'Entitlements to add or overwrite, e.g. {"com.apple.security.network.client": true}. '
+        "Values: true/false, strings, numbers, arrays or dictionaries."))] = None,
+    remove: Annotated[list[str] | None, Field(description=(
+        'Entitlement keys to remove, e.g. ["com.apple.security.network.client"].'))] = None,
+    copy_to: Annotated[str | None, Field(description=(
+        "Work on a copy at this path (ending in .app, outside app_path; an earlier copy there is "
+        "replaced). Recommended: without it the app is changed in place."))] = None,
+) -> str:
+    """Re-sign an .app ad-hoc with entitlements added or removed, to test one
+    sandbox permission without rebuilding (A/B: a copy with it, a copy
+    without). The other entitlements are kept, plus get-task-allow.
     Nested code (frameworks, dylibs, extensions, XPC services, helper apps)
     is re-signed first, deepest first; extensions, XPC services and helper
-    apps keep their own entitlements."""
+    apps keep their own entitlements. With the hardened runtime on,
+    disable-library-validation is added so ad-hoc libraries load (local
+    runs only). Returns JSON: the app path, signed, verify_ok (codesign
+    --verify --deep --strict), the entitlements now signed and any nested
+    signing errors."""
     src, _ = _bundle(app_path)
     try:
         plistlib.dumps(add or {})
@@ -429,18 +487,36 @@ async def resign_adhoc(app_path: str, add: dict | None = None, remove: list[str]
                       indent=2, default=str)
 
 
-@mcp.tool()
-async def launch_with_trace(app_path: str, env: dict | None = None, seconds: int = 30,
-                            console_filter: str | None = None,
-                            evidence_dir: str | None = None,
-                            log_predicate: str | None = None) -> str:
-    """Run the app's executable directly (sandbox applies) with `env`, for at
-    most `seconds` (it may exit sooner). Captures stdout/stderr (only lines
-    containing `console_filter` if given) and, in parallel, system log lines
-    from the kernel/Sandbox about this process (or `log_predicate`). Saves
-    console.txt, system_log.txt and entitlements.json to `evidence_dir`."""
-    if not 1 <= seconds <= 600:
-        raise ValueError("seconds must be between 1 and 600")
+@mcp.tool(annotations=ToolAnnotations(title="Run the app and record a trace", readOnlyHint=False,
+                                      destructiveHint=False, idempotentHint=False))
+async def launch_with_trace(
+    app_path: Annotated[str, Field(description="The .app to run: a macOS or Mac Catalyst build.")],
+    env: Annotated[dict[str, str | int | float | bool] | None, Field(description=(
+        'Environment variables for the app, e.g. {"MY_DEBUG_FLAG": "1"}.'))] = None,
+    seconds: Annotated[int, Field(ge=1, le=600, description="Maximum run time; the app may exit sooner.")] = 30,
+    console_filter: Annotated[str | None, Field(description=(
+        "Only return console lines that contain this text (the full console is saved anyway)."))] = None,
+    evidence_dir: Annotated[str | None, Field(description=(
+        "Folder for the evidence files. Default: a new folder under "
+        "~/Desktop/xcode_local_builds/evidence."))] = None,
+    log_predicate: Annotated[str | None, Field(description=(
+        "Custom `log stream --predicate` (NSPredicate) instead of the default: kernel and "
+        "Sandbox messages that mention the executable."))] = None,
+) -> str:
+    """Run an .app's executable directly, with its App Sandbox, for at most
+    `seconds`, and record what happened (e.g. to prove that the sandbox
+    blocks something). Captures the app's stdout/stderr and, at the same
+    time, kernel/Sandbox log lines that mention it ("Sandbox: App(pid)
+    deny(1) network-outbound ..."). When it ends or time is up, the app and
+    any process it left behind are stopped.
+    Returns JSON: exit (exit code or "timeout (terminated)"; exit_signal if
+    it was killed), the last 60 console lines, the last 40 system log lines,
+    totals, hints and the evidence folder (console_full.txt, console.txt,
+    system_log.txt, entitlements.json).
+    An empty system_log does not prove nothing was denied: macOS drops the
+    report if the app exits right after the violation and stops reporting
+    repeated ones for a while. The app's own error in the console is the
+    first evidence. Simulator builds cannot be run here."""
     app, info = _bundle(app_path)
     platforms = info.get("CFBundleSupportedPlatforms") or []
     if any(p.endswith("Simulator") for p in platforms):
@@ -521,6 +597,18 @@ async def launch_with_trace(app_path: str, env: dict | None = None, seconds: int
            "system_log": _tail(syslog, 40), "system_log_lines_total": len(syslog)}
     if console_filter:
         res["console_lines_matched"] = len(lines)
+    hints = []
+    if isinstance(exit_code, int) and exit_code < 0:
+        try:
+            res["exit_signal"] = signal.Signals(-exit_code).name
+        except ValueError:
+            res["exit_signal"] = f"signal {-exit_code}"
+        if -exit_code == signal.SIGKILL:
+            hints.append("killed by the system (SIGKILL). Right at launch this usually means the "
+                         "signature or entitlements were rejected: restricted ones (com.apple.developer.*, "
+                         "keychain-access-groups...) need a provisioning profile. Check show_entitlements "
+                         "and remove them with resign_adhoc.")
+    res["hints"] = hints
     return json.dumps(res, indent=2, ensure_ascii=False, default=str)
 
 
