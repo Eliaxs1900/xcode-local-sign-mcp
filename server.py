@@ -44,6 +44,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
+from xml.etree import ElementTree
 
 import anyio
 from mcp.server.fastmcp import FastMCP
@@ -241,6 +242,32 @@ async def _entitlements(app: str, strict: bool = False) -> dict:
         return {"_raw": r.out}
 
 
+def _workspace_projects(ws: Path) -> list[Path]:
+    """The .xcodeproj files a workspace references in contents.xcworkspacedata
+    (group:, container: and absolute: locations, through nested groups)."""
+    data = ws / "contents.xcworkspacedata"
+    try:
+        if data.stat().st_size > 1_000_000:
+            return []
+        root = ElementTree.parse(data).getroot()
+    except (OSError, ElementTree.ParseError):
+        return []
+    found: list[Path] = []
+
+    def walk(node, base: Path) -> None:
+        for child in node:
+            kind, _, loc = (child.get("location") or "").partition(":")
+            path = {"group": base / loc, "container": ws.parent / loc,
+                    "absolute": Path(loc)}.get(kind, base)
+            if child.tag == "Group":
+                walk(child, path)
+            elif child.tag == "FileRef" and path.suffix == ".xcodeproj":
+                found.append(path)
+
+    walk(root, ws.parent)
+    return found
+
+
 NESTED_CODE = (".framework", ".dylib", ".appex", ".xpc", ".app")
 
 
@@ -301,19 +328,22 @@ async def signing_status(
         except Exception:
             info = {"error": ("timed out after 300 s" if r.timed_out else r.err[-800:])}
         out["list"] = info
-        pbx = None
         if args[0] == "-project":
-            pbx = Path(args[1]) / "project.pbxproj"
+            projects = [Path(args[1])]
         else:
-            cands = list(Path(args[1]).parent.glob("*.xcodeproj/project.pbxproj"))
-            pbx = cands[0] if cands else None
-        if pbx and pbx.exists():
-            txt = pbx.read_text(errors="replace")
-            keys = r"(DEVELOPMENT_TEAM|CODE_SIGN_STYLE|CODE_SIGN_IDENTITY|CODE_SIGN_ENTITLEMENTS|ENABLE_APP_SANDBOX|ENABLE_HARDENED_RUNTIME|ENABLE_[A-Z_]*NETWORK[A-Z_]*|SUPPORTS_MACCATALYST|SUPPORTED_PLATFORMS)"
-            found: dict[str, set] = {}
-            for m in re.finditer(keys + r'\s*=\s*"?([^";]*)"?;', txt):
+            # The projects the workspace references (they can live in other
+            # folders); the old guess, *.xcodeproj next to it, as a fallback.
+            ws = Path(args[1])
+            projects = _workspace_projects(ws) or sorted(ws.parent.glob("*.xcodeproj"))
+        pbxs = [p / "project.pbxproj" for p in projects if (p / "project.pbxproj").is_file()]
+        keys = r"(DEVELOPMENT_TEAM|CODE_SIGN_STYLE|CODE_SIGN_IDENTITY|CODE_SIGN_ENTITLEMENTS|ENABLE_APP_SANDBOX|ENABLE_HARDENED_RUNTIME|ENABLE_[A-Z_]*NETWORK[A-Z_]*|SUPPORTS_MACCATALYST|SUPPORTED_PLATFORMS)"
+        found: dict[str, set] = {}
+        for pbx in pbxs:
+            for m in re.finditer(keys + r'\s*=\s*"?([^";]*)"?;', pbx.read_text(errors="replace")):
                 found.setdefault(m.group(1), set()).add(m.group(2))
+        if pbxs:
             out["project_settings"] = {k: sorted(v) for k, v in found.items()}
+            out["project_files"] = [str(p.parent) for p in pbxs]
     out["advice"] = ("No identity: use build_local (ad-hoc). Tests on macOS need a free "
                      "Apple Development cert (Xcode ▸ Settings ▸ Accounts, done by the user)."
                      if out["identity_count"] == 0 else
