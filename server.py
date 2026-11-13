@@ -54,6 +54,18 @@ ADHOC = ["CODE_SIGN_IDENTITY=-", "DEVELOPMENT_TEAM=", "CODE_SIGN_STYLE=Manual",
 DEFAULT_OUT = Path.home() / "Desktop" / "xcode_local_builds"
 # KEY=VALUE, with optional conditions: OTHER_LDFLAGS[sdk=macosx*][arch=arm64]=...
 BUILD_SETTING = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\[[^\]=]+=[^\]]*\])*=")
+# Replies stay small: lines are cut to this length and only the tail of long
+# outputs is returned. Everything is kept in full in the log/evidence files.
+MAX_LINE = 400
+
+
+def _clip(line: str) -> str:
+    line = line.rstrip()
+    return line if len(line) <= MAX_LINE else f"{line[:MAX_LINE]}… [+{len(line) - MAX_LINE} chars]"
+
+
+def _tail(lines: list[str], n: int) -> list[str]:
+    return [_clip(l) for l in lines[-n:]]
 
 
 # --- subprocesses -----------------------------------------------------------
@@ -227,13 +239,17 @@ def _nested_code(app: Path) -> list[Path]:
     return sorted(found, key=lambda p: len(p.parts), reverse=True)
 
 
-def _errors(text: str, limit: int = 25) -> list[str]:
+def _errors(text: str) -> list[str]:
+    """Distinct error lines of an xcodebuild log, in order. `\\bld:` so that
+    "xcodebuild: WARNING" is not taken for a linker error."""
     seen, out = set(), []
     for line in text.splitlines():
-        if (re.search(r"\berror:|ld: (?!warning)|\*\* (BUILD|TEST) FAILED", line)
+        line = line.strip()
+        if (re.search(r"\berror:|\bld: (?!warning)|\*\* (BUILD|TEST) (FAILED|INTERRUPTED)", line)
                 and line not in seen):
-            seen.add(line); out.append(line.strip())
-    return out[:limit]
+            seen.add(line)
+            out.append(line)
+    return out
 
 
 # --- tools ------------------------------------------------------------------
@@ -321,9 +337,14 @@ async def build_local(project: str, scheme: str,
     if "was modified during the build" in text:
         hints.append("package resolution raced with Xcode: rerun")
     apps = sorted(str(p) for p in (dd / "Build" / "Products").glob(f"{glob.escape(configuration)}*/*.app"))
+    errors = _errors(text)
     res = {"ok": ok, "timed_out": r.timed_out, "exit_code": r.code, "seconds": r.seconds,
-           "command": shlex.join(cmd), "log": str(log), "errors": _errors(text), "hints": hints,
+           "command": shlex.join(cmd), "log": str(log),
+           "errors": [_clip(e) for e in errors[:25]], "errors_total": len(errors), "hints": hints,
            "apps": {a: await _entitlements(a) for a in apps} if ok else {}}
+    if not ok and not any("error:" in e for e in errors):
+        # Failed without a recognisable error line: show how the log ends.
+        res["log_tail"] = _tail(text.splitlines(), 30)
     return json.dumps(res, indent=2, ensure_ascii=False, default=str)
 
 
@@ -401,8 +422,10 @@ async def resign_adhoc(app_path: str, add: dict | None = None, remove: list[str]
     v = await _run(["codesign", "--verify", "--deep", "--strict", str(app)], 120)
     return json.dumps({"app": str(app), "signed": r.code == 0, "sign_stderr": r.err.strip(),
                        "verify_ok": v.code == 0, "verify": v.err.strip(),
-                       "nested_signed": [str(n.relative_to(app)) for n in nested],
-                       "nested_errors": logs, "entitlements": await _entitlements(str(app))},
+                       "nested_signed": [str(n.relative_to(app)) for n in nested[:50]],
+                       "nested_signed_total": len(nested),
+                       "nested_errors": [_clip(l) for l in logs[:20]],
+                       "entitlements": await _entitlements(str(app))},
                       indent=2, default=str)
 
 
@@ -442,8 +465,14 @@ async def launch_with_trace(app_path: str, env: dict | None = None, seconds: int
     bad = [k for k, v in env.items() if not k or "=" in k or "\0" in k + v]
     if bad:
         raise ValueError(f"env: invalid variable names or values for {bad}")
-    out = Path(evidence_dir).expanduser() if evidence_dir else DEFAULT_OUT / "evidence" / time.strftime("%Y%m%d-%H%M%S")
-    out.mkdir(parents=True, exist_ok=True)
+    if evidence_dir:
+        out = Path(evidence_dir).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+    else:   # one new folder per launch: two launches in the same second do not mix
+        root = DEFAULT_OUT / "evidence"
+        root.mkdir(parents=True, exist_ok=True)
+        stem = re.sub(r"[^A-Za-z0-9]+", "_", exe_name)
+        out = Path(tempfile.mkdtemp(prefix=f"{time.strftime('%Y%m%d-%H%M%S')}-{stem}-", dir=root))
     quoted = exe_name.replace("\\", "\\\\").replace('"', '\\"')   # NSPredicate string literal
     pred = log_predicate or (f'(process == "kernel" OR sender == "Sandbox" OR process == "sandboxd") '
                              f'AND eventMessage CONTAINS "{quoted}" '
@@ -478,18 +507,21 @@ async def launch_with_trace(app_path: str, env: dict | None = None, seconds: int
                     await _stop(p)
                 await _stop(logp)
     elapsed = round(time.monotonic() - t0, 1)
-    lines = console_full.read_text(errors="replace").splitlines()
-    if console_filter:
-        lines = [l for l in lines if console_filter in l]
+    all_lines = console_full.read_text(errors="replace").splitlines()
+    lines = [l for l in all_lines if console_filter in l] if console_filter else all_lines
     (out / "console.txt").write_text(header + "\n".join(lines) + "\n")
     ents = await _entitlements(str(app))
     (out / "entitlements.json").write_text(json.dumps(ents, indent=2, default=str))
     syslog = [l for l in (out / "system_log.txt").read_text(errors="replace").splitlines()
               if l and not l.startswith(("Filtering", "Timestamp"))]
-    return json.dumps({"evidence_dir": str(out), "exit": exit_code,
-                       "seconds": elapsed, "children_killed": children_killed,
-                       "entitlements": ents, "console": lines[-60:], "system_log": syslog[-40:]},
-                      indent=2, ensure_ascii=False, default=str)
+    res = {"evidence_dir": str(out), "exit": exit_code,
+           "seconds": elapsed, "children_killed": children_killed, "entitlements": ents,
+           "console": _tail(lines, 60), "console_lines_total": len(all_lines),
+           "console_full": str(console_full),
+           "system_log": _tail(syslog, 40), "system_log_lines_total": len(syslog)}
+    if console_filter:
+        res["console_lines_matched"] = len(lines)
+    return json.dumps(res, indent=2, ensure_ascii=False, default=str)
 
 
 if __name__ == "__main__":
