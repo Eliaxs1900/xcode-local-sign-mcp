@@ -21,6 +21,8 @@ Tools (their descriptions and parameter docs below are what the AI client sees)
   launch_with_trace   run the app's binary with env vars, capture its console
                       (optionally filtered) plus kernel/sandbox log lines, save
                       everything to an evidence folder
+  clean_builds        list / delete the builds and copies made here and
+                      unregister their apps from LaunchServices
 
 Limits (stated, not hidden)
   * XCUITest/XCTest on macOS still need a development certificate: Xcode
@@ -62,15 +64,26 @@ Typical flow:
    gives a copy with and a copy without it.
 4. launch_with_trace(app, env, seconds): runs it and returns its console and
    the kernel's sandbox log lines; everything is saved in an evidence folder.
+5. When the user is done testing: clean_builds() lists the builds and copies
+   made here; after the user agrees, clean_builds(delete=true) deletes them
+   and unregisters their apps from LaunchServices.
 
-Ad-hoc apps only run on this Mac. XCTest/XCUITest still need a development
-certificate (the user signs in to Xcode with an Apple ID)."""
+Builds and evidence go to ~/Desktop/xcode_local_builds unless the user set
+XCODE_LOCAL_SIGN_OUT. Ad-hoc apps only run on this Mac. XCTest/XCUITest
+still need a development certificate (the user signs in to Xcode with an
+Apple ID)."""
 
 mcp = FastMCP("xcode-local-sign", instructions=INSTRUCTIONS)
 
 ADHOC = ["CODE_SIGN_IDENTITY=-", "DEVELOPMENT_TEAM=", "CODE_SIGN_STYLE=Manual",
          "PROVISIONING_PROFILE_SPECIFIER="]
-DEFAULT_OUT = Path.home() / "Desktop" / "xcode_local_builds"
+# Output folder for builds and evidence; XCODE_LOCAL_SIGN_OUT overrides it.
+DEFAULT_OUT = Path(os.environ.get("XCODE_LOCAL_SIGN_OUT")
+                   or Path.home() / "Desktop" / "xcode_local_builds").expanduser()
+# What build_local and resign_adhoc created, so clean_builds removes only that.
+MANIFEST = DEFAULT_OUT / ".xcode-local-sign.json"
+LSREGISTER = ("/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/"
+              "LaunchServices.framework/Versions/Current/Support/lsregister")
 # KEY=VALUE, with optional conditions: OTHER_LDFLAGS[sdk=macosx*][arch=arm64]=...
 BUILD_SETTING = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\[[^\]=]+=[^\]]*\])*=")
 # Replies stay small: lines are cut to this length and only the tail of long
@@ -242,6 +255,51 @@ async def _entitlements(app: str, strict: bool = False) -> dict:
         return {"_raw": r.out}
 
 
+def _manifest() -> list[dict]:
+    try:
+        data = json.loads(MANIFEST.read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [i for i in data if isinstance(i, dict) and isinstance(i.get("path"), str)]
+
+
+def _save_manifest(items: list[dict]) -> None:
+    MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MANIFEST.with_name(MANIFEST.name + ".tmp")
+    tmp.write_text(json.dumps(items, indent=2, ensure_ascii=False))
+    tmp.replace(MANIFEST)
+
+
+def _remember(path: Path, kind: str) -> None:
+    """Record a build folder or .app copy this server created."""
+    p = str(path.resolve())
+    items = [i for i in _manifest() if i["path"] != p]
+    items.append({"path": p, "kind": kind, "created": time.strftime("%Y-%m-%d %H:%M:%S")})
+    _save_manifest(items)
+
+
+def _ours() -> dict[str, dict]:
+    """What clean_builds may remove, by resolved path: recorded items that
+    still exist, plus build folders right inside the output folder (made
+    before there was a record)."""
+    items = {i["path"]: i for i in _manifest() if Path(i["path"]).exists()}
+    if DEFAULT_OUT.is_dir():
+        for d in DEFAULT_OUT.iterdir():
+            if d.is_dir() and (d / "build_local.log").is_file():
+                items.setdefault(str(d.resolve()), {"path": str(d.resolve()), "kind": "build"})
+    return items
+
+
+def _apps_in(item: dict) -> list[Path]:
+    """The .app bundles of a build folder or copy, nested apps included
+    (Xcode registers them all with LaunchServices)."""
+    p = Path(item["path"])
+    tops = [p] if item.get("kind") == "copy" else sorted((p / "Build" / "Products").glob("*/*.app"))
+    return [a for top in tops for a in (top, *(n for n in _nested_code(top) if n.suffix == ".app"))]
+
+
 def _workspace_projects(ws: Path) -> list[Path]:
     """The .xcodeproj files a workspace references in contents.xcworkspacedata
     (group:, container: and absolute: locations, through nested groups)."""
@@ -362,8 +420,9 @@ async def build_local(
         "launch_with_trace cannot run Simulator apps)."))] = "platform=macOS,variant=Mac Catalyst",
     configuration: Annotated[str, Field(description="Build configuration, usually Debug or Release.")] = "Debug",
     derived_data: Annotated[str | None, Field(description=(
-        "Folder for the build products and build_local.log. Default: "
-        "~/Desktop/xcode_local_builds/<scheme>_<destination>, reused so rebuilds are incremental."))] = None,
+        "Folder for the build products and build_local.log. Default: <output folder>/"
+        "<scheme>_<destination>, reused so rebuilds are incremental (output folder: "
+        "~/Desktop/xcode_local_builds or $XCODE_LOCAL_SIGN_OUT)."))] = None,
     extra_settings: Annotated[list[str] | None, Field(description=(
         "Extra build settings, each KEY=VALUE, e.g. ['ENABLE_OUTGOING_NETWORK_CONNECTIONS=NO']. "
         "Actions or options such as 'clean' or '-quiet' are refused."))] = None,
@@ -385,7 +444,10 @@ async def build_local(
     # scheme and destination become one folder name: no '/' or '..' survives.
     slug = re.sub(r"[^A-Za-z0-9]+", "_", f"{scheme}_{destination}").strip("_")
     dd = Path(derived_data).expanduser() if derived_data else DEFAULT_OUT / slug
+    created = not dd.exists()
     dd.mkdir(parents=True, exist_ok=True)
+    if created or not derived_data:   # never a folder the caller already had
+        _remember(dd, "build")
     cmd = ["xcodebuild", *args, "-scheme", scheme, "-destination", destination,
            "-configuration", configuration, "-derivedDataPath", str(dd), "build",
            *ADHOC, *(extra_settings or [])]
@@ -439,8 +501,8 @@ async def resign_adhoc(
     remove: Annotated[list[str] | None, Field(description=(
         'Entitlement keys to remove, e.g. ["com.apple.security.network.client"].'))] = None,
     copy_to: Annotated[str | None, Field(description=(
-        "Work on a copy at this path (ending in .app, outside app_path; an earlier copy there is "
-        "replaced). Recommended: without it the app is changed in place."))] = None,
+        "Work on a copy at this path (ending in .app, outside app_path; only an earlier copy made "
+        "by resign_adhoc is replaced). Recommended: without it the app is changed in place."))] = None,
 ) -> str:
     """Re-sign an .app ad-hoc with entitlements added or removed, to test one
     sandbox permission without rebuilding (A/B: a copy with it, a copy
@@ -467,15 +529,17 @@ async def resign_adhoc(
         if d == s or s in d.parents or d in s.parents:
             raise ValueError("copy_to must be outside app_path (omit copy_to to re-sign in place)")
         if app.exists() or app.is_symlink():
-            # Only ever replace a previous copy, never an arbitrary folder.
-            if not _is_bundle(app):
-                raise ValueError(f"copy_to exists and is not an .app bundle, refusing to replace it: {app}")
+            # Only ever replace a copy made here, never an app or folder of the user's.
+            if not _is_bundle(app) or str(d) not in _ours():
+                raise ValueError(f"copy_to already exists and is not a copy made by resign_adhoc, "
+                                 f"refusing to replace it: {app}. Pick another path.")
             r = await _run(["rm", "-rf", str(app)], 300)
             if r.code:
                 raise RuntimeError(f"cannot remove {app}: {r.err.strip()}")
         r = await _run(["ditto", str(src), str(app)], 600)
         if r.code:
             raise RuntimeError(f"ditto {src} -> {app} failed: {r.err.strip()}")
+        _remember(app, "copy")
     ents = await _entitlements(str(app))
     ents.pop("_raw", None)
     for k in remove or []:
@@ -527,8 +591,7 @@ async def launch_with_trace(
     console_filter: Annotated[str | None, Field(description=(
         "Only return console lines that contain this text (the full console is saved anyway)."))] = None,
     evidence_dir: Annotated[str | None, Field(description=(
-        "Folder for the evidence files. Default: a new folder under "
-        "~/Desktop/xcode_local_builds/evidence."))] = None,
+        "Folder for the evidence files. Default: a new folder under <output folder>/evidence."))] = None,
     log_predicate: Annotated[str | None, Field(description=(
         "Custom `log stream --predicate` (NSPredicate) instead of the default: kernel and "
         "Sandbox messages that mention the executable."))] = None,
@@ -640,6 +703,59 @@ async def launch_with_trace(
                          "and remove them with resign_adhoc.")
     res["hints"] = hints
     return json.dumps(res, indent=2, ensure_ascii=False, default=str)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Clean up builds and copies", readOnlyHint=False,
+                                      destructiveHint=True, idempotentHint=True, openWorldHint=False))
+async def clean_builds(
+    paths: Annotated[list[str] | None, Field(description=(
+        "Only these build folders or .app copies (as listed here, or as returned by "
+        "build_local/resign_adhoc). Default: all of them."))] = None,
+    delete: Annotated[bool, Field(description=(
+        "false (default): only list what would be removed, with sizes. true: unregister each "
+        ".app from LaunchServices and delete it. Ask the user before passing true."))] = False,
+) -> str:
+    """List, and with delete=true remove, what build_local and resign_adhoc
+    created: build (derived-data) folders and .app copies. Each .app is also
+    unregistered from LaunchServices: Xcode registers every app it builds,
+    so old test builds otherwise keep showing up in Spotlight, Launchpad and
+    "Open With". Only what this server created (it keeps a record in the
+    output folder) can be removed; evidence folders and sandbox containers
+    (~/Library/Containers) are left alone.
+    Returns JSON: each item with kind, size_mb and its .app bundles, and
+    with delete=true whether it was unregistered and deleted."""
+    ours = _ours()
+    if paths:
+        chosen = {}
+        for raw in paths:
+            key = str(Path(raw).expanduser().resolve())
+            if key not in ours:
+                raise ValueError(f"not a build folder or copy made by this server, refusing to touch it: {raw}")
+            chosen[key] = ours[key]
+    else:
+        chosen = ours
+    report = []
+    for key, item in sorted(chosen.items()):
+        apps = _apps_in(item)
+        du = (await _run(["du", "-sk", key], 300)).out.split()
+        entry = {"path": key, "kind": item.get("kind"),
+                 "size_mb": round(int(du[0]) / 1024, 1) if du and du[0].isdigit() else None,
+                 "apps": [str(a) for a in apps]}
+        if delete:
+            entry["unregistered"] = [str(a) for a in apps
+                                     if (await _run([LSREGISTER, "-u", str(a)], 60)).code == 0]
+            r = await _run(["rm", "-rf", key], 900)
+            entry["deleted"] = not Path(key).exists()
+            if r.code:
+                entry["error"] = _clip(r.err.strip())
+        report.append(entry)
+    if delete:
+        _save_manifest([i for i in _manifest() if Path(i["path"]).exists()])
+    res = {"output_folder": str(DEFAULT_OUT), "dry_run": not delete, "items": report,
+           "total_mb": round(sum(e["size_mb"] or 0 for e in report), 1)}
+    if report and not delete:
+        res["next"] = "Show this list to the user; if they agree, call clean_builds(delete=true)."
+    return json.dumps(res, indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":
