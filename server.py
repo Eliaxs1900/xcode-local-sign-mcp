@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2,<2"]
+# dependencies = ["mcp>=1.10,<2"]
 # ///
 """xcode-local-sign-mcp: build, sign and run Xcode apps on this Mac WITHOUT an
 Apple developer certificate, and capture a log trace as proof.
@@ -10,7 +10,7 @@ no signing identity, so a plain `xcodebuild` fails or produces an app the
 sandbox will not run. Ad-hoc signing ("-") is enough to build and launch
 locally, with the app's real entitlements and App Sandbox enforced.
 
-Tools
+Tools (their descriptions and parameter docs below are what the AI client sees)
   signing_status      identities in the keychain, the project's teams/signing
                       settings and sandbox entitlement build settings
   build_local         xcodebuild with ad-hoc signing (team cleared); returns the
@@ -21,6 +21,8 @@ Tools
   launch_with_trace   run the app's binary with env vars, capture its console
                       (optionally filtered) plus kernel/sandbox log lines, save
                       everything to an evidence folder
+  clean_builds        list / delete the builds and copies made here and
+                      unregister their apps from LaunchServices
 
 Limits (stated, not hidden)
   * XCUITest/XCTest on macOS still need a development certificate: Xcode
@@ -30,6 +32,7 @@ Limits (stated, not hidden)
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import plistlib
@@ -39,23 +42,192 @@ import signal
 import subprocess
 import tempfile
 import time
+from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Annotated, Any
+from xml.etree import ElementTree
 
+import anyio
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
-mcp = FastMCP("xcode-local-sign")
+INSTRUCTIONS = """\
+Builds, signs and runs Xcode apps on this Mac without an Apple developer
+certificate (ad-hoc signing), and records what the App Sandbox did.
+
+Typical flow:
+1. signing_status(project): schemes, team and sandbox settings.
+2. build_local(project, scheme): ad-hoc build; returns the .app and its entitlements.
+3. To test one permission: resign_adhoc(app, add=... or remove=..., copy_to=...)
+   gives a copy with and a copy without it.
+4. launch_with_trace(app, env, seconds): runs it and returns its console and
+   the kernel's sandbox log lines; everything is saved in an evidence folder.
+5. When the user is done testing: clean_builds() lists the builds and copies
+   made here; after the user agrees, clean_builds(delete=true) deletes them
+   and unregisters their apps from LaunchServices.
+
+Builds and evidence go to ~/Desktop/xcode_local_builds unless the user set
+XCODE_LOCAL_SIGN_OUT. Ad-hoc apps only run on this Mac. XCTest/XCUITest
+still need a development certificate (the user signs in to Xcode with an
+Apple ID)."""
+
+mcp = FastMCP("xcode-local-sign", instructions=INSTRUCTIONS)
 
 ADHOC = ["CODE_SIGN_IDENTITY=-", "DEVELOPMENT_TEAM=", "CODE_SIGN_STYLE=Manual",
          "PROVISIONING_PROFILE_SPECIFIER="]
-DEFAULT_OUT = Path.home() / "Desktop" / "xcode_local_builds"
+# Output folder for builds and evidence; XCODE_LOCAL_SIGN_OUT overrides it.
+DEFAULT_OUT = Path(os.environ.get("XCODE_LOCAL_SIGN_OUT")
+                   or Path.home() / "Desktop" / "xcode_local_builds").expanduser()
+# What build_local and resign_adhoc created, so clean_builds removes only that.
+MANIFEST = DEFAULT_OUT / ".xcode-local-sign.json"
+LSREGISTER = ("/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/"
+              "LaunchServices.framework/Versions/Current/Support/lsregister")
+# KEY=VALUE, with optional conditions: OTHER_LDFLAGS[sdk=macosx*][arch=arm64]=...
+BUILD_SETTING = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\[[^\]=]+=[^\]]*\])*=")
+# Replies stay small: lines are cut to this length and only the tail of long
+# outputs is returned. Everything is kept in full in the log/evidence files.
+MAX_LINE = 400
 
 
-def _run(cmd: list[str], timeout: int = 1800, cwd: str | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+def _clip(line: str) -> str:
+    line = line.rstrip()
+    return line if len(line) <= MAX_LINE else f"{line[:MAX_LINE]}… [+{len(line) - MAX_LINE} chars]"
+
+
+def _tail(lines: list[str], n: int) -> list[str]:
+    return [_clip(l) for l in lines[-n:]]
+
+
+# --- subprocesses -----------------------------------------------------------
+# Every command runs without a shell, with stdin closed (the server's stdin is
+# the MCP channel: a child must never read it) and in its own process group,
+# so a timeout or a cancelled request can stop it together with its children.
+# Output goes to files, never pipes: a grandchild that keeps a pipe open could
+# otherwise block the read forever.
+
+@dataclass
+class Run:
+    code: int | None   # exit status; negative = killed by that signal
+    out: str
+    err: str
+    timed_out: bool
+    seconds: float
+
+
+def _killpg(pgid: int, sig: int) -> bool:
+    """Send `sig` to a process group. False if the group no longer exists."""
+    try:
+        os.killpg(pgid, sig)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+async def _reap_group(pgid: int) -> bool:
+    """Stop whatever is left in a process group after its leader exited
+    (children that outlived it). True if something was left."""
+    if not _killpg(pgid, 0):
+        return False
+    _killpg(pgid, signal.SIGTERM)
+    for _ in range(30):
+        await anyio.sleep(0.1)
+        if not _killpg(pgid, 0):
+            return True
+    _killpg(pgid, signal.SIGKILL)
+    return True
+
+
+async def _stop(proc, first: int = signal.SIGTERM) -> None:
+    """Stop a process and its group: `first`, then SIGTERM, then SIGKILL.
+    xcodebuild gets SIGINT first: it then cancels the build in its build
+    service, whose script phases and compilers live in other process groups
+    and would be orphaned by a plain kill."""
+    for sig in dict.fromkeys((first, signal.SIGTERM, signal.SIGKILL)):
+        if proc.returncode is not None:
+            break
+        _killpg(proc.pid, sig)
+        with anyio.move_on_after(15 if sig == signal.SIGINT else 5):
+            await proc.wait()
+    await _reap_group(proc.pid)
+
+
+async def _start(cmd: list[str], stdout, stderr, env: dict | None = None):
+    try:
+        return await anyio.open_process(cmd, stdin=subprocess.DEVNULL, stdout=stdout,
+                                        stderr=stderr, env=env, start_new_session=True)
+    except OSError as e:
+        hint = " (is Xcode installed? check `xcode-select -p`)" if "/" not in cmd[0] else ""
+        raise RuntimeError(f"cannot run {cmd[0]}: {e.strerror or e}{hint}") from e
+
+
+async def _run(cmd: list[str], timeout: float = 1800, *, log: Path | None = None,
+               first_signal: int = signal.SIGTERM) -> Run:
+    """Run `cmd`; output to `log` (stdout+stderr interleaved) or captured.
+    Never raises on timeout: the group is stopped and timed_out is set. If the
+    MCP request is cancelled, the group is stopped before the cancellation
+    propagates."""
+    t0 = time.monotonic()
+    with ExitStack() as files:
+        if log is not None:
+            out = files.enter_context(open(log, "wb"))
+            err = subprocess.STDOUT
+        else:
+            out = files.enter_context(tempfile.TemporaryFile())
+            err = files.enter_context(tempfile.TemporaryFile())
+        proc = await _start(cmd, out, err)
+        try:
+            with anyio.move_on_after(timeout) as deadline:
+                await proc.wait()
+        finally:
+            with anyio.CancelScope(shield=True):
+                if proc.returncode is None:
+                    await _stop(proc, first_signal)
+                else:
+                    await _reap_group(proc.pid)
+
+        def text(f) -> str:
+            if log is not None:
+                return ""
+            f.seek(0)
+            return f.read().decode(errors="replace")
+
+        return Run(proc.returncode, text(out), text(err), deadline.cancelled_caught,
+                   round(time.monotonic() - t0, 1))
+
+
+# --- helpers ----------------------------------------------------------------
+# Inputs are checked before anything is run, copied or deleted, and errors say
+# what was expected (the caller is usually an AI that will retry).
+
+def _existing(path: str, what: str) -> Path:
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise ValueError(f"{what} not found: {p}")
+    return p
+
+
+def _is_bundle(p: Path) -> bool:
+    """A real .app folder (not a symlink) with an Info.plist."""
+    return (p.suffix == ".app" and p.is_dir() and not p.is_symlink()
+            and ((p / "Contents" / "Info.plist").is_file() or (p / "Info.plist").is_file()))
+
+
+def _bundle(app_path: str) -> tuple[Path, dict]:
+    """Check that app_path is an .app bundle and return it with its Info.plist."""
+    app = _existing(app_path, "app")
+    if not _is_bundle(app):
+        raise ValueError(f"not an .app bundle (a folder ending in .app with an Info.plist): {app}")
+    plist = app / "Contents" / "Info.plist" if (app / "Contents").is_dir() else app / "Info.plist"
+    try:
+        return app, plistlib.loads(plist.read_bytes())
+    except Exception as e:
+        raise ValueError(f"unreadable Info.plist in {app}: {e}") from e
 
 
 def _container_args(project: str) -> list[str]:
-    p = Path(project).expanduser()
+    p = _existing(project, "project")
     if p.suffix == ".xcworkspace":
         return ["-workspace", str(p)]
     if p.suffix == ".xcodeproj":
@@ -69,57 +241,167 @@ def _container_args(project: str) -> list[str]:
     raise ValueError(f"no .xcodeproj or .xcworkspace in {p}")
 
 
-def _entitlements(app: str) -> dict:
-    r = _run(["codesign", "-d", "--entitlements", "-", "--xml", app], timeout=60)
-    data = r.stdout.encode()
+async def _entitlements(app: str, strict: bool = False) -> dict:
+    r = await _run(["codesign", "-d", "--entitlements", "-", "--xml", app], 60)
+    if strict and r.code:
+        # e.g. "code object is not signed at all": not the same as "no entitlements"
+        raise ValueError(f"codesign cannot read {app}: {r.err.strip()}")
+    data = r.out.encode()
     if not data.strip():
         return {}
     try:
         return plistlib.loads(data)
     except Exception:
-        return {"_raw": r.stdout}
+        return {"_raw": r.out}
 
 
-def _errors(text: str, limit: int = 25) -> list[str]:
+def _manifest() -> list[dict]:
+    try:
+        data = json.loads(MANIFEST.read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [i for i in data if isinstance(i, dict) and isinstance(i.get("path"), str)]
+
+
+def _save_manifest(items: list[dict]) -> None:
+    MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MANIFEST.with_name(MANIFEST.name + ".tmp")
+    tmp.write_text(json.dumps(items, indent=2, ensure_ascii=False))
+    tmp.replace(MANIFEST)
+
+
+def _remember(path: Path, kind: str) -> None:
+    """Record a build folder or .app copy this server created."""
+    p = str(path.resolve())
+    items = [i for i in _manifest() if i["path"] != p]
+    items.append({"path": p, "kind": kind, "created": time.strftime("%Y-%m-%d %H:%M:%S")})
+    _save_manifest(items)
+
+
+def _ours() -> dict[str, dict]:
+    """What clean_builds may remove, by resolved path: recorded items that
+    still exist, plus build folders right inside the output folder (made
+    before there was a record)."""
+    items = {i["path"]: i for i in _manifest() if Path(i["path"]).exists()}
+    if DEFAULT_OUT.is_dir():
+        for d in DEFAULT_OUT.iterdir():
+            if d.is_dir() and (d / "build_local.log").is_file():
+                items.setdefault(str(d.resolve()), {"path": str(d.resolve()), "kind": "build"})
+    return items
+
+
+def _apps_in(item: dict) -> list[Path]:
+    """The .app bundles of a build folder or copy, nested apps included
+    (Xcode registers them all with LaunchServices)."""
+    p = Path(item["path"])
+    tops = [p] if item.get("kind") == "copy" else sorted((p / "Build" / "Products").glob("*/*.app"))
+    return [a for top in tops for a in (top, *(n for n in _nested_code(top) if n.suffix == ".app"))]
+
+
+def _workspace_projects(ws: Path) -> list[Path]:
+    """The .xcodeproj files a workspace references in contents.xcworkspacedata
+    (group:, container: and absolute: locations, through nested groups)."""
+    data = ws / "contents.xcworkspacedata"
+    try:
+        if data.stat().st_size > 1_000_000:
+            return []
+        root = ElementTree.parse(data).getroot()
+    except (OSError, ElementTree.ParseError):
+        return []
+    found: list[Path] = []
+
+    def walk(node, base: Path) -> None:
+        for child in node:
+            kind, _, loc = (child.get("location") or "").partition(":")
+            path = {"group": base / loc, "container": ws.parent / loc,
+                    "absolute": Path(loc)}.get(kind, base)
+            if child.tag == "Group":
+                walk(child, path)
+            elif child.tag == "FileRef" and path.suffix == ".xcodeproj":
+                found.append(path)
+
+    walk(root, ws.parent)
+    return found
+
+
+NESTED_CODE = (".framework", ".dylib", ".appex", ".xpc", ".app")
+
+
+def _nested_code(app: Path) -> list[Path]:
+    """Code inside `app`, deepest first: each piece has to be signed before
+    whatever contains it. Symlinks are skipped (their target is signed
+    through its real path); os.walk does not follow them either."""
+    found = []
+    for root, dirs, files in os.walk(app):
+        for name in dirs + files:
+            p = Path(root) / name
+            if name.endswith(NESTED_CODE) and not p.is_symlink():
+                found.append(p)
+    return sorted(found, key=lambda p: len(p.parts), reverse=True)
+
+
+def _errors(text: str) -> list[str]:
+    """Distinct error lines of an xcodebuild log, in order. `\\bld:` so that
+    "xcodebuild: WARNING" is not taken for a linker error."""
     seen, out = set(), []
     for line in text.splitlines():
-        if (re.search(r"\berror:|ld: (?!warning)|\*\* (BUILD|TEST) FAILED", line)
+        line = line.strip()
+        if (re.search(r"\berror:|\bld: (?!warning)|\*\* (BUILD|TEST) (FAILED|INTERRUPTED)", line)
                 and line not in seen):
-            seen.add(line); out.append(line.strip())
-    return out[:limit]
+            seen.add(line)
+            out.append(line)
+    return out
 
 
-@mcp.tool()
-def signing_status(project: str | None = None) -> str:
-    """Signing identities on this Mac and, if `project` is given (folder,
-    .xcodeproj or .xcworkspace), its team, signing style and sandbox/network
-    entitlement build settings."""
+# --- tools ------------------------------------------------------------------
+
+PROJECT_DOC = ("Folder that contains the project, or the path of a .xcodeproj or "
+               ".xcworkspace (a folder with both uses the workspace).")
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Signing status", readOnlyHint=True))
+async def signing_status(
+    project: Annotated[str | None, Field(description=PROJECT_DOC + " Omit it to only check this Mac.")] = None,
+) -> str:
+    """Check how this Mac and a project are set up for signing, before building.
+    Returns JSON: the code-signing identities in the keychain (usually none,
+    which is why build_local signs ad-hoc), the Xcode version and, with
+    `project`, its schemes and targets (xcodebuild -list) plus the signing and
+    sandbox build settings in its project files (DEVELOPMENT_TEAM,
+    CODE_SIGN_*, ENABLE_APP_SANDBOX, ENABLE_*NETWORK*...). Changes nothing."""
     out: dict = {}
-    r = _run(["security", "find-identity", "-v", "-p", "codesigning"], timeout=30)
-    out["identities"] = [l.strip() for l in r.stdout.splitlines() if '"' in l]
+    r = await _run(["security", "find-identity", "-v", "-p", "codesigning"], 30)
+    out["identities"] = [l.strip() for l in r.out.splitlines() if '"' in l]
     out["identity_count"] = len(out["identities"])
-    out["xcode"] = _run(["xcodebuild", "-version"], timeout=60).stdout.strip()
+    r = await _run(["xcodebuild", "-version"], 60)
+    # With only the Command Line Tools selected this explains why, on stderr.
+    out["xcode"] = r.out.strip() if r.code == 0 else f"error: {r.err.strip()}"
     if project:
         args = _container_args(project)
-        r = _run(["xcodebuild", *args, "-list", "-json"], timeout=300)
+        r = await _run(["xcodebuild", *args, "-list", "-json"], 300)
         try:
-            info = json.loads(r.stdout)
+            info = json.loads(r.out)
         except Exception:
-            info = {"error": r.stderr[-800:]}
+            info = {"error": ("timed out after 300 s" if r.timed_out else r.err[-800:])}
         out["list"] = info
-        pbx = None
         if args[0] == "-project":
-            pbx = Path(args[1]) / "project.pbxproj"
+            projects = [Path(args[1])]
         else:
-            cands = list(Path(args[1]).parent.glob("*.xcodeproj/project.pbxproj"))
-            pbx = cands[0] if cands else None
-        if pbx and pbx.exists():
-            txt = pbx.read_text(errors="replace")
-            keys = r"(DEVELOPMENT_TEAM|CODE_SIGN_STYLE|CODE_SIGN_IDENTITY|CODE_SIGN_ENTITLEMENTS|ENABLE_APP_SANDBOX|ENABLE_HARDENED_RUNTIME|ENABLE_[A-Z_]*NETWORK[A-Z_]*|SUPPORTS_MACCATALYST|SUPPORTED_PLATFORMS)"
-            found: dict[str, set] = {}
-            for m in re.finditer(keys + r'\s*=\s*"?([^";]*)"?;', txt):
+            # The projects the workspace references (they can live in other
+            # folders); the old guess, *.xcodeproj next to it, as a fallback.
+            ws = Path(args[1])
+            projects = _workspace_projects(ws) or sorted(ws.parent.glob("*.xcodeproj"))
+        pbxs = [p / "project.pbxproj" for p in projects if (p / "project.pbxproj").is_file()]
+        keys = r"(DEVELOPMENT_TEAM|CODE_SIGN_STYLE|CODE_SIGN_IDENTITY|CODE_SIGN_ENTITLEMENTS|ENABLE_APP_SANDBOX|ENABLE_HARDENED_RUNTIME|ENABLE_[A-Z_]*NETWORK[A-Z_]*|SUPPORTS_MACCATALYST|SUPPORTED_PLATFORMS)"
+        found: dict[str, set] = {}
+        for pbx in pbxs:
+            for m in re.finditer(keys + r'\s*=\s*"?([^";]*)"?;', pbx.read_text(errors="replace")):
                 found.setdefault(m.group(1), set()).add(m.group(2))
+        if pbxs:
             out["project_settings"] = {k: sorted(v) for k, v in found.items()}
+            out["project_files"] = [str(p.parent) for p in pbxs]
     out["advice"] = ("No identity: use build_local (ad-hoc). Tests on macOS need a free "
                      "Apple Development cert (Xcode ▸ Settings ▸ Accounts, done by the user)."
                      if out["identity_count"] == 0 else
@@ -127,65 +409,138 @@ def signing_status(project: str | None = None) -> str:
     return json.dumps(out, indent=2, ensure_ascii=False)
 
 
-@mcp.tool()
-def build_local(project: str, scheme: str,
-                destination: str = "platform=macOS,variant=Mac Catalyst",
-                configuration: str = "Debug",
-                derived_data: str | None = None,
-                extra_settings: list[str] | None = None,
-                timeout_s: int = 1800) -> str:
-    """Build `scheme` signed ad-hoc (no certificate, team cleared). Destination
-    examples: 'platform=macOS,variant=Mac Catalyst', 'platform=macOS',
-    'platform=iOS Simulator,name=iPad Pro 13-inch (M5)'. extra_settings are
-    KEY=VALUE build settings (e.g. ENABLE_OUTGOING_NETWORK_CONNECTIONS=NO).
-    Returns the built .app path(s), their entitlements and any errors."""
+@mcp.tool(annotations=ToolAnnotations(title="Build with ad-hoc signing", readOnlyHint=False,
+                                      destructiveHint=False, idempotentHint=True))
+async def build_local(
+    project: Annotated[str, Field(description=PROJECT_DOC)],
+    scheme: Annotated[str, Field(description="Scheme to build; signing_status(project) lists them.")],
+    destination: Annotated[str, Field(description=(
+        "xcodebuild -destination: 'platform=macOS,variant=Mac Catalyst' (iPad apps on the Mac), "
+        "'platform=macOS' (native Mac apps) or 'generic/platform=iOS Simulator' (only builds: "
+        "launch_with_trace cannot run Simulator apps)."))] = "platform=macOS,variant=Mac Catalyst",
+    configuration: Annotated[str, Field(description="Build configuration, usually Debug or Release.")] = "Debug",
+    derived_data: Annotated[str | None, Field(description=(
+        "Folder for the build products and build_local.log. Default: <output folder>/"
+        "<scheme>_<destination>, reused so rebuilds are incremental (output folder: "
+        "~/Desktop/xcode_local_builds or $XCODE_LOCAL_SIGN_OUT)."))] = None,
+    extra_settings: Annotated[list[str] | None, Field(description=(
+        "Extra build settings, each KEY=VALUE, e.g. ['ENABLE_OUTGOING_NETWORK_CONNECTIONS=NO']. "
+        "Actions or options such as 'clean' or '-quiet' are refused."))] = None,
+    timeout_s: Annotated[int, Field(ge=10, le=7200, description="Stop the build after this many seconds.")] = 1800,
+) -> str:
+    """Build a scheme with ad-hoc signing: no certificate needed (team and
+    provisioning profile are cleared), so a cloned project builds and runs on
+    this Mac with its real entitlements and App Sandbox.
+    Returns JSON: ok, timed_out, exit_code, seconds, the exact xcodebuild
+    command, the log path, up to 25 error lines (errors_total), hints for
+    common failures and the built .app paths with their signed entitlements.
+    May take minutes; on timeout or cancellation the build is stopped cleanly."""
+    bad = [s for s in extra_settings or [] if not BUILD_SETTING.match(s)]
+    if bad:
+        # Anything else would reach xcodebuild as an action ('clean') or an option.
+        raise ValueError("extra_settings only takes KEY=VALUE build settings, e.g. "
+                         f"ENABLE_OUTGOING_NETWORK_CONNECTIONS=NO; refused: {bad}")
     args = _container_args(project)
-    dd = Path(derived_data).expanduser() if derived_data else DEFAULT_OUT / f"{scheme}_{re.sub(r'[^A-Za-z0-9]+', '_', destination)}"
+    # scheme and destination become one folder name: no '/' or '..' survives.
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", f"{scheme}_{destination}").strip("_")
+    dd = Path(derived_data).expanduser() if derived_data else DEFAULT_OUT / slug
+    created = not dd.exists()
     dd.mkdir(parents=True, exist_ok=True)
+    if created or not derived_data:   # never a folder the caller already had
+        _remember(dd, "build")
     cmd = ["xcodebuild", *args, "-scheme", scheme, "-destination", destination,
            "-configuration", configuration, "-derivedDataPath", str(dd), "build",
            *ADHOC, *(extra_settings or [])]
-    t0 = time.time()
-    r = _run(cmd, timeout=timeout_s)
     log = dd / "build_local.log"
-    log.write_text(r.stdout + r.stderr)
-    text = r.stdout + r.stderr
-    ok = "** BUILD SUCCEEDED **" in text
+    # The log is written while xcodebuild runs, so a timeout keeps what it had.
+    r = await _run(cmd, timeout_s, log=log, first_signal=signal.SIGINT)
+    text = log.read_text(errors="replace")
+    ok = r.code == 0 and "** BUILD SUCCEEDED **" in text
     hints = []
+    if r.timed_out:
+        hints.append(f"timed out after {timeout_s} s: the build was interrupted "
+                     "(partial log in `log`); raise timeout_s to wait longer")
     if "missing Metal Toolchain" in text:
         hints.append("run: xcodebuild -downloadComponent MetalToolchain")
     if "unknown file type" in text and ".a'" in text:
         hints.append("static libs look like Git LFS pointers: git lfs install --local && git lfs pull")
     if "was modified during the build" in text:
         hints.append("package resolution raced with Xcode: rerun")
-    apps = sorted(str(p) for p in (dd / "Build" / "Products").glob(f"{configuration}*/*.app"))
-    res = {"ok": ok, "seconds": round(time.time() - t0, 1), "command": shlex.join(cmd),
-           "log": str(log), "errors": _errors(text), "hints": hints,
-           "apps": {a: _entitlements(a) for a in apps} if ok else {}}
+    apps = sorted(str(p) for p in (dd / "Build" / "Products").glob(f"{glob.escape(configuration)}*/*.app"))
+    errors = _errors(text)
+    res = {"ok": ok, "timed_out": r.timed_out, "exit_code": r.code, "seconds": r.seconds,
+           "command": shlex.join(cmd), "log": str(log),
+           "errors": [_clip(e) for e in errors[:25]], "errors_total": len(errors), "hints": hints,
+           "apps": {a: await _entitlements(a) for a in apps} if ok else {}}
+    if not ok and not any("error:" in e for e in errors):
+        # Failed without a recognisable error line: show how the log ends.
+        res["log_tail"] = _tail(text.splitlines(), 30)
     return json.dumps(res, indent=2, ensure_ascii=False, default=str)
 
 
-@mcp.tool()
-def show_entitlements(app_path: str) -> str:
-    """Entitlements actually signed into an .app (what the sandbox enforces)."""
-    return json.dumps(_entitlements(str(Path(app_path).expanduser())), indent=2, default=str)
+@mcp.tool(annotations=ToolAnnotations(title="Show signed entitlements", readOnlyHint=True,
+                                      openWorldHint=False))
+async def show_entitlements(
+    app_path: Annotated[str, Field(description="The .app bundle, e.g. one returned by build_local or resign_adhoc.")],
+) -> str:
+    """Entitlements signed into an .app: what the App Sandbox and the system
+    actually enforce, which can differ from the project's .entitlements file.
+    Returns them as JSON ({} means signed without entitlements). Fails if the
+    path does not exist or is not signed. Changes nothing."""
+    app = _existing(app_path, "app")
+    return json.dumps(await _entitlements(str(app), strict=True), indent=2, default=str)
 
 
-@mcp.tool()
-def resign_adhoc(app_path: str, add: dict | None = None, remove: list[str] | None = None,
-                 copy_to: str | None = None) -> str:
-    """Re-sign an .app ad-hoc keeping its entitlements, with keys added
-    (`add`, e.g. {"com.apple.security.network.client": true}) or removed
-    (`remove`). `copy_to` works on a copy so the original build stays intact.
-    Nested frameworks/dylibs are re-signed first."""
-    src = Path(app_path).expanduser()
+@mcp.tool(annotations=ToolAnnotations(title="Re-sign ad-hoc with other entitlements", readOnlyHint=False,
+                                      destructiveHint=True, idempotentHint=True, openWorldHint=False))
+async def resign_adhoc(
+    app_path: Annotated[str, Field(description="The .app to re-sign.")],
+    add: Annotated[dict[str, Any] | None, Field(description=(
+        'Entitlements to add or overwrite, e.g. {"com.apple.security.network.client": true}. '
+        "Values: true/false, strings, numbers, arrays or dictionaries."))] = None,
+    remove: Annotated[list[str] | None, Field(description=(
+        'Entitlement keys to remove, e.g. ["com.apple.security.network.client"].'))] = None,
+    copy_to: Annotated[str | None, Field(description=(
+        "Work on a copy at this path (ending in .app, outside app_path; only an earlier copy made "
+        "by resign_adhoc is replaced). Recommended: without it the app is changed in place."))] = None,
+) -> str:
+    """Re-sign an .app ad-hoc with entitlements added or removed, to test one
+    sandbox permission without rebuilding (A/B: a copy with it, a copy
+    without). The other entitlements are kept, plus get-task-allow.
+    Nested code (frameworks, dylibs, extensions, XPC services, helper apps)
+    is re-signed first, deepest first; extensions, XPC services and helper
+    apps keep their own entitlements. With the hardened runtime on,
+    disable-library-validation is added so ad-hoc libraries load (local
+    runs only). Returns JSON: the app path, signed, verify_ok (codesign
+    --verify --deep --strict), the entitlements now signed and any nested
+    signing errors."""
+    src, _ = _bundle(app_path)
+    try:
+        plistlib.dumps(add or {})
+    except (TypeError, OverflowError) as e:
+        raise ValueError("add: values must be plist types (true/false, strings, numbers, "
+                         f"arrays, dictionaries); {e}") from e
     app = src
     if copy_to:
         app = Path(copy_to).expanduser()
-        if app.exists():
-            subprocess.run(["rm", "-rf", str(app)], check=True)
-        subprocess.run(["ditto", str(src), str(app)], check=True)
-    ents = _entitlements(str(app))
+        s, d = src.resolve(), app.resolve()
+        if d.suffix != ".app":
+            raise ValueError(f"copy_to must be a path ending in .app: {app}")
+        if d == s or s in d.parents or d in s.parents:
+            raise ValueError("copy_to must be outside app_path (omit copy_to to re-sign in place)")
+        if app.exists() or app.is_symlink():
+            # Only ever replace a copy made here, never an app or folder of the user's.
+            if not _is_bundle(app) or str(d) not in _ours():
+                raise ValueError(f"copy_to already exists and is not a copy made by resign_adhoc, "
+                                 f"refusing to replace it: {app}. Pick another path.")
+            r = await _run(["rm", "-rf", str(app)], 300)
+            if r.code:
+                raise RuntimeError(f"cannot remove {app}: {r.err.strip()}")
+        r = await _run(["ditto", str(src), str(app)], 600)
+        if r.code:
+            raise RuntimeError(f"ditto {src} -> {app} failed: {r.err.strip()}")
+        _remember(app, "copy")
+    ents = await _entitlements(str(app))
     ents.pop("_raw", None)
     for k in remove or []:
         ents.pop(k, None)
@@ -194,82 +549,213 @@ def resign_adhoc(app_path: str, add: dict | None = None, remove: list[str] | Non
     # Keep the original signature's flags. With hardened runtime, ad-hoc
     # nested dylibs fail Library Validation (no team ID to match), so allow
     # them — local runs only.
-    dv = _run(["codesign", "-dv", str(app)], timeout=60).stderr
+    dv = (await _run(["codesign", "-dv", str(app)], 60)).err
     runtime = bool(re.search(r"flags=0x[0-9a-f]+\([^)]*runtime", dv))
     if runtime:
         ents["com.apple.security.cs.disable-library-validation"] = True
-    nested = sorted({str(p) for pat in ("**/*.framework", "**/*.dylib", "**/*.appex", "**/*.xpc")
-                     for p in app.glob(pat)}, key=len, reverse=True)
+    nested = _nested_code(app)
     logs = []
     for n in nested:
-        r = _run(["codesign", "--force", "--sign", "-", "--timestamp=none", n], timeout=120)
-        if r.returncode:
-            logs.append(f"{n}: {r.stderr.strip()}")
-    with tempfile.NamedTemporaryFile("wb", suffix=".plist", delete=False) as f:
-        plistlib.dump(ents, f); ent_file = f.name
-    r = _run(["codesign", "--force", "--sign", "-", "--timestamp=none",
-              *(["--options", "runtime"] if runtime else []),
-              "--entitlements", ent_file, str(app)], timeout=300)
-    v = _run(["codesign", "--verify", "--deep", "--strict", str(app)], timeout=120)
-    return json.dumps({"app": str(app), "signed": r.returncode == 0, "sign_stderr": r.stderr.strip(),
-                       "verify_ok": v.returncode == 0, "verify": v.stderr.strip(),
-                       "nested_errors": logs, "entitlements": _entitlements(str(app))},
+        # Extensions, XPC services and helper apps carry their own entitlements
+        # (usually their own sandbox); re-signing without them breaks them.
+        keep = ["--preserve-metadata=entitlements"] if n.suffix in (".appex", ".xpc", ".app") else []
+        r = await _run(["codesign", "--force", "--sign", "-", "--timestamp=none", *keep, str(n)], 120)
+        if r.code:
+            logs.append(f"{n}: {r.err.strip()}")
+    fd, ent_file = tempfile.mkstemp(suffix=".plist")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            plistlib.dump(ents, f)
+        r = await _run(["codesign", "--force", "--sign", "-", "--timestamp=none",
+                        *(["--options", "runtime"] if runtime else []),
+                        "--entitlements", ent_file, str(app)], 300)
+    finally:
+        os.unlink(ent_file)
+    v = await _run(["codesign", "--verify", "--deep", "--strict", str(app)], 120)
+    return json.dumps({"app": str(app), "signed": r.code == 0, "sign_stderr": r.err.strip(),
+                       "verify_ok": v.code == 0, "verify": v.err.strip(),
+                       "nested_signed": [str(n.relative_to(app)) for n in nested[:50]],
+                       "nested_signed_total": len(nested),
+                       "nested_errors": [_clip(l) for l in logs[:20]],
+                       "entitlements": await _entitlements(str(app))},
                       indent=2, default=str)
 
 
-@mcp.tool()
-def launch_with_trace(app_path: str, env: dict | None = None, seconds: int = 30,
-                      console_filter: str | None = None,
-                      evidence_dir: str | None = None,
-                      log_predicate: str | None = None) -> str:
-    """Run the app's executable directly (sandbox applies) with `env`, for at
-    most `seconds` (it may exit sooner). Captures stdout/stderr (only lines
-    containing `console_filter` if given) and, in parallel, system log lines
-    from the kernel/Sandbox about this process (or `log_predicate`). Saves
-    console.txt, system_log.txt and entitlements.json to `evidence_dir`."""
-    app = Path(app_path).expanduser()
-    info = plistlib.loads((app / ("Contents/Info.plist" if (app / "Contents").exists() else "Info.plist")).read_bytes())
-    exe_name = info["CFBundleExecutable"]
+@mcp.tool(annotations=ToolAnnotations(title="Run the app and record a trace", readOnlyHint=False,
+                                      destructiveHint=False, idempotentHint=False))
+async def launch_with_trace(
+    app_path: Annotated[str, Field(description="The .app to run: a macOS or Mac Catalyst build.")],
+    env: Annotated[dict[str, str | int | float | bool] | None, Field(description=(
+        'Environment variables for the app, e.g. {"MY_DEBUG_FLAG": "1"}.'))] = None,
+    seconds: Annotated[int, Field(ge=1, le=600, description="Maximum run time; the app may exit sooner.")] = 30,
+    console_filter: Annotated[str | None, Field(description=(
+        "Only return console lines that contain this text (the full console is saved anyway)."))] = None,
+    evidence_dir: Annotated[str | None, Field(description=(
+        "Folder for the evidence files. Default: a new folder under <output folder>/evidence."))] = None,
+    log_predicate: Annotated[str | None, Field(description=(
+        "Custom `log stream --predicate` (NSPredicate) instead of the default: kernel and "
+        "Sandbox messages that mention the executable."))] = None,
+) -> str:
+    """Run an .app's executable directly, with its App Sandbox, for at most
+    `seconds`, and record what happened (e.g. to prove that the sandbox
+    blocks something). Captures the app's stdout/stderr and, at the same
+    time, kernel/Sandbox log lines that mention it ("Sandbox: App(pid)
+    deny(1) network-outbound ..."). When it ends or time is up, the app and
+    any process it left behind are stopped.
+    Returns JSON: exit (exit code or "timeout (terminated)"; exit_signal if
+    it was killed), the last 60 console lines, the last 40 system log lines,
+    totals, hints and the evidence folder (console_full.txt, console.txt,
+    system_log.txt, entitlements.json).
+    An empty system_log does not prove nothing was denied: macOS drops the
+    report if the app exits right after the violation and stops reporting
+    repeated ones for a while. The app's own error in the console is the
+    first evidence. Simulator builds cannot be run here."""
+    app, info = _bundle(app_path)
+    platforms = info.get("CFBundleSupportedPlatforms") or []
+    if any(p.endswith("Simulator") for p in platforms):
+        bid = info.get("CFBundleIdentifier", "<bundle id>")
+        raise ValueError(
+            f"{app.name} is a Simulator build ({', '.join(platforms)}); it cannot run directly "
+            f"on macOS. Run it in a booted simulator: xcrun simctl install booted "
+            f"{shlex.quote(str(app))} && xcrun simctl launch --console booted {bid}. "
+            "Or rebuild with destination 'platform=macOS,variant=Mac Catalyst' or 'platform=macOS'.")
+    if "iPhoneOS" in platforms:
+        raise ValueError(f"{app.name} is an iOS device build; rebuild it for "
+                         "'platform=macOS,variant=Mac Catalyst' to run it on this Mac")
+    exe_name = info.get("CFBundleExecutable")
+    if not exe_name:
+        raise ValueError(f"no CFBundleExecutable in the Info.plist of {app}")
     exe = app / "Contents" / "MacOS" / exe_name
     if not exe.exists():
         exe = app / exe_name
-    out = Path(evidence_dir).expanduser() if evidence_dir else DEFAULT_OUT / "evidence" / time.strftime("%Y%m%d-%H%M%S")
-    out.mkdir(parents=True, exist_ok=True)
+    if not exe.is_file() or not os.access(exe, os.X_OK):
+        raise ValueError(f"executable missing or not executable: {exe} (incomplete build?)")
+    env = {str(k): str(v) for k, v in (env or {}).items()}
+    bad = [k for k, v in env.items() if not k or "=" in k or "\0" in k + v]
+    if bad:
+        raise ValueError(f"env: invalid variable names or values for {bad}")
+    if evidence_dir:
+        out = Path(evidence_dir).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+    else:   # one new folder per launch: two launches in the same second do not mix
+        root = DEFAULT_OUT / "evidence"
+        root.mkdir(parents=True, exist_ok=True)
+        stem = re.sub(r"[^A-Za-z0-9]+", "_", exe_name)
+        out = Path(tempfile.mkdtemp(prefix=f"{time.strftime('%Y%m%d-%H%M%S')}-{stem}-", dir=root))
+    quoted = exe_name.replace("\\", "\\\\").replace('"', '\\"')   # NSPredicate string literal
     pred = log_predicate or (f'(process == "kernel" OR sender == "Sandbox" OR process == "sandboxd") '
-                             f'AND eventMessage CONTAINS "{exe_name}" '
+                             f'AND eventMessage CONTAINS "{quoted}" '
                              f'AND NOT eventMessage CONTAINS "ReportCrash"')
-    logf = open(out / "system_log.txt", "w")
-    logp = subprocess.Popen(["/usr/bin/log", "stream", "--style", "compact", "--predicate", pred],
-                            stdout=logf, stderr=subprocess.STDOUT)
-    time.sleep(2)
-    full_env = {**os.environ, **{k: str(v) for k, v in (env or {}).items()}}
-    t0 = time.time()
-    p = subprocess.Popen([str(exe)], env=full_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    try:
-        raw, _ = p.communicate(timeout=seconds)
-        exit_code = p.returncode
-    except subprocess.TimeoutExpired:
-        p.send_signal(signal.SIGTERM)
+    full_env = {**os.environ, **env}
+    header = "$ " + " ".join([*(f"{k}={shlex.quote(v)}" for k, v in env.items()), shlex.quote(str(exe))]) + "\n"
+    console_full = out / "console_full.txt"
+    t0 = time.monotonic()
+    children_killed = False
+    with open(out / "system_log.txt", "wb") as logf, open(console_full, "wb") as conf:
+        logp = await _start(["/usr/bin/log", "stream", "--style", "compact", "--predicate", pred],
+                            logf, subprocess.STDOUT)
+        p = None
         try:
-            raw, _ = p.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            p.kill(); raw, _ = p.communicate()
-        exit_code = "timeout (terminated)"
-    time.sleep(2)
-    logp.terminate(); logp.wait(timeout=5); logf.close()
-    lines = raw.splitlines()
-    if console_filter:
-        lines = [l for l in lines if console_filter in l]
-    header = f"$ {' '.join(f'{k}={v}' for k, v in (env or {}).items())} {exe}\n"
+            await anyio.sleep(2)
+            t0 = time.monotonic()
+            # The app writes straight to the file: if it leaves a child holding
+            # its stdout, nothing here waits for that child.
+            p = await _start([str(exe)], conf, subprocess.STDOUT, full_env)
+            with anyio.move_on_after(seconds):
+                await p.wait()
+            if p.returncode is None:
+                exit_code = "timeout (terminated)"
+                await _stop(p)
+            else:
+                exit_code = p.returncode
+                children_killed = await _reap_group(p.pid)
+            await anyio.sleep(2)
+        finally:
+            with anyio.CancelScope(shield=True):
+                if p is not None and p.returncode is None:
+                    await _stop(p)
+                await _stop(logp)
+    elapsed = round(time.monotonic() - t0, 1)
+    all_lines = console_full.read_text(errors="replace").splitlines()
+    lines = [l for l in all_lines if console_filter in l] if console_filter else all_lines
     (out / "console.txt").write_text(header + "\n".join(lines) + "\n")
-    ents = _entitlements(str(app))
+    ents = await _entitlements(str(app))
     (out / "entitlements.json").write_text(json.dumps(ents, indent=2, default=str))
     syslog = [l for l in (out / "system_log.txt").read_text(errors="replace").splitlines()
               if l and not l.startswith(("Filtering", "Timestamp"))]
-    return json.dumps({"evidence_dir": str(out), "exit": exit_code,
-                       "seconds": round(time.time() - t0, 1),
-                       "entitlements": ents, "console": lines[-60:], "system_log": syslog[-40:]},
-                      indent=2, ensure_ascii=False, default=str)
+    res = {"evidence_dir": str(out), "exit": exit_code,
+           "seconds": elapsed, "children_killed": children_killed, "entitlements": ents,
+           "console": _tail(lines, 60), "console_lines_total": len(all_lines),
+           "console_full": str(console_full),
+           "system_log": _tail(syslog, 40), "system_log_lines_total": len(syslog)}
+    if console_filter:
+        res["console_lines_matched"] = len(lines)
+    hints = []
+    if isinstance(exit_code, int) and exit_code < 0:
+        try:
+            res["exit_signal"] = signal.Signals(-exit_code).name
+        except ValueError:
+            res["exit_signal"] = f"signal {-exit_code}"
+        if -exit_code == signal.SIGKILL:
+            hints.append("killed by the system (SIGKILL). Right at launch this usually means the "
+                         "signature or entitlements were rejected: restricted ones (com.apple.developer.*, "
+                         "keychain-access-groups...) need a provisioning profile. Check show_entitlements "
+                         "and remove them with resign_adhoc.")
+    res["hints"] = hints
+    return json.dumps(res, indent=2, ensure_ascii=False, default=str)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Clean up builds and copies", readOnlyHint=False,
+                                      destructiveHint=True, idempotentHint=True, openWorldHint=False))
+async def clean_builds(
+    paths: Annotated[list[str] | None, Field(description=(
+        "Only these build folders or .app copies (as listed here, or as returned by "
+        "build_local/resign_adhoc). Default: all of them."))] = None,
+    delete: Annotated[bool, Field(description=(
+        "false (default): only list what would be removed, with sizes. true: unregister each "
+        ".app from LaunchServices and delete it. Ask the user before passing true."))] = False,
+) -> str:
+    """List, and with delete=true remove, what build_local and resign_adhoc
+    created: build (derived-data) folders and .app copies. Each .app is also
+    unregistered from LaunchServices: Xcode registers every app it builds,
+    so old test builds otherwise keep showing up in Spotlight, Launchpad and
+    "Open With". Only what this server created (it keeps a record in the
+    output folder) can be removed; evidence folders and sandbox containers
+    (~/Library/Containers) are left alone.
+    Returns JSON: each item with kind, size_mb and its .app bundles, and
+    with delete=true whether it was unregistered and deleted."""
+    ours = _ours()
+    if paths:
+        chosen = {}
+        for raw in paths:
+            key = str(Path(raw).expanduser().resolve())
+            if key not in ours:
+                raise ValueError(f"not a build folder or copy made by this server, refusing to touch it: {raw}")
+            chosen[key] = ours[key]
+    else:
+        chosen = ours
+    report = []
+    for key, item in sorted(chosen.items()):
+        apps = _apps_in(item)
+        du = (await _run(["du", "-sk", key], 300)).out.split()
+        entry = {"path": key, "kind": item.get("kind"),
+                 "size_mb": round(int(du[0]) / 1024, 1) if du and du[0].isdigit() else None,
+                 "apps": [str(a) for a in apps]}
+        if delete:
+            entry["unregistered"] = [str(a) for a in apps
+                                     if (await _run([LSREGISTER, "-u", str(a)], 60)).code == 0]
+            r = await _run(["rm", "-rf", key], 900)
+            entry["deleted"] = not Path(key).exists()
+            if r.code:
+                entry["error"] = _clip(r.err.strip())
+        report.append(entry)
+    if delete:
+        _save_manifest([i for i in _manifest() if Path(i["path"]).exists()])
+    res = {"output_folder": str(DEFAULT_OUT), "dry_run": not delete, "items": report,
+           "total_mb": round(sum(e["size_mb"] or 0 for e in report), 1)}
+    if report and not delete:
+        res["next"] = "Show this list to the user; if they agree, call clean_builds(delete=true)."
+    return json.dumps(res, indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":
